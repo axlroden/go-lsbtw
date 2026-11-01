@@ -1,16 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 )
 
 func main() {
+	// ls lives for a few ms, so skip GC entirely. the limit turns it back on
+	// if a huge directory would otherwise eat all the ram
+	debug.SetGCPercent(-1)
+	debug.SetMemoryLimit(256 << 20)
+
 	path := "."
 	show_all, long_format := false, false
 
@@ -52,12 +59,16 @@ func main() {
 		names = append(names, entry.Name())
 	}
 
+	// one write(2) at the end instead of one per line
+	out := bufio.NewWriterSize(os.Stdout, 64<<10)
+	defer out.Flush()
+
 	if long_format {
-		print_long(path, names)
+		print_long(out, path, names)
 		return
 	}
 	for _, name := range names {
-		fmt.Println(name)
+		fmt.Fprintln(out, name)
 	}
 }
 
@@ -98,20 +109,19 @@ func mode_string(mode uint32) string {
 	return string(s[:])
 }
 
-type long_row struct {
-	mode  string
-	links uint64
-	owner string
-	group string
-	size  int64
-	time  string
-	name  string
+// align: -1 left, 1 right, 0 none. fmt treats a negative %*s width as left-align
+type cell struct {
+	text  string
+	align int
 }
 
 // two passes: stat everything first, then we know how wide each column is
-func print_long(dir string, names []string) {
-	var rows []long_row
-	links_width, owner_width, group_width, size_width := 0, 0, 0, 0
+func print_long(out *bufio.Writer, dir string, names []string) {
+	rows := make([][7]cell, 0, len(names))
+	var width [7]int
+	// libc reopens /etc/passwd on every lookup, so ask once per id. unknown ids
+	// print as the raw number, right-aligned like every other number in real ls
+	owners, groups := map[uint32]cell{}, map[uint32]cell{}
 
 	for _, name := range names {
 		full_path := filepath.Join(dir, name)
@@ -121,44 +131,48 @@ func print_long(dir string, names []string) {
 			continue
 		}
 		file_stats := file_info.Sys().(*syscall.Stat_t)
-		owner, group := "?", "?"
-		if u, error := user.LookupId(strconv.Itoa(int(file_stats.Uid))); error == nil {
-			owner = u.Username
+		owner, ok := owners[file_stats.Uid]
+		if !ok {
+			owner = cell{strconv.Itoa(int(file_stats.Uid)), 1}
+			if u, error := user.LookupId(owner.text); error == nil {
+				owner = cell{u.Username, -1}
+			}
+			owners[file_stats.Uid] = owner
 		}
-		if g, error := user.LookupGroupId(strconv.Itoa(int(file_stats.Gid))); error == nil {
-			group = g.Name
+		group, ok := groups[file_stats.Gid]
+		if !ok {
+			group = cell{strconv.Itoa(int(file_stats.Gid)), 1}
+			if g, error := user.LookupGroupId(group.text); error == nil {
+				group = cell{g.Name, -1}
+			}
+			groups[file_stats.Gid] = group
 		}
 		if file_info.Mode()&os.ModeSymlink != 0 {
 			if target, error := os.Readlink(full_path); error == nil {
 				name += " -> " + target
 			}
 		}
-		row := long_row{
-			mode:  mode_string(uint32(file_stats.Mode)),
-			links: uint64(file_stats.Nlink),
-			owner: owner,
-			group: group,
-			size:  file_info.Size(),
-			time:  file_info.ModTime().Format("Jan _2 15:04"),
-			name:  name,
+		row := [7]cell{
+			{mode_string(uint32(file_stats.Mode)), 0},
+			{strconv.FormatUint(uint64(file_stats.Nlink), 10), 1},
+			owner,
+			group,
+			{strconv.FormatInt(file_info.Size(), 10), 1},
+			{file_info.ModTime().Format("Jan _2 15:04"), 0},
+			{name, 0},
 		}
-		links_width = max(links_width, len(strconv.FormatUint(row.links, 10)))
-		owner_width = max(owner_width, len(row.owner))
-		group_width = max(group_width, len(row.group))
-		size_width = max(size_width, len(strconv.FormatInt(row.size, 10)))
+		for i, c := range row {
+			width[i] = max(width[i], len(c.text))
+		}
 		rows = append(rows, row)
 	}
 
-	// numbers right-aligned, names left-aligned, same as real ls
+	args := make([]any, 0, 14)
 	for _, row := range rows {
-		fmt.Printf("%s %*d %-*s %-*s %*d %s %s\n",
-			row.mode,
-			links_width, row.links,
-			owner_width, row.owner,
-			group_width, row.group,
-			size_width, row.size,
-			row.time,
-			row.name,
-		)
+		args = args[:0]
+		for i, c := range row {
+			args = append(args, c.align*width[i], c.text)
+		}
+		fmt.Fprintf(out, "%*s %*s %*s %*s %*s %*s %*s\n", args...)
 	}
 }
