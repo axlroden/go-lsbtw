@@ -6,10 +6,14 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -41,34 +45,43 @@ func main() {
 		}
 	}
 
-	entries, error := os.ReadDir(path)
+	// os.Root keeps the directory open, so every stat below is an fstatat
+	// on its fd instead of the kernel walking the full path again
+	root, error := os.OpenRoot(path)
 	if error != nil {
 		fmt.Fprintln(os.Stderr, error)
 		os.Exit(1)
 	}
-
-	var names []string
+	dir, error := root.Open(".")
+	if error != nil {
+		fmt.Fprintln(os.Stderr, error)
+		os.Exit(1)
+	}
+	// Readdirnames skips the DirEntry per file that ReadDir allocates, and
+	// sorting plain strings beats sorting interfaces
+	names, error := dir.Readdirnames(-1)
+	if error != nil {
+		fmt.Fprintln(os.Stderr, error)
+		os.Exit(1)
+	}
+	slices.Sort(names)
 	if show_all {
-		names = append(names, ".", "..")
+		names = append([]string{".", ".."}, names...)
+	} else {
+		names = slices.DeleteFunc(names, func(name string) bool { return name[0] == '.' })
 	}
 
-	for _, entry := range entries {
-		if !show_all && strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		names = append(names, entry.Name())
-	}
-
-	// one write(2) at the end instead of one per line
+	// one write(2) per 64k instead of one per line
 	out := bufio.NewWriterSize(os.Stdout, 64<<10)
 	defer out.Flush()
 
 	if long_format {
-		print_long(out, path, names)
+		print_long(out, root, names)
 		return
 	}
 	for _, name := range names {
-		fmt.Fprintln(out, name)
+		out.WriteString(name)
+		out.WriteByte('\n')
 	}
 }
 
@@ -109,70 +122,110 @@ func mode_string(mode uint32) string {
 	return string(s[:])
 }
 
-// align: -1 left, 1 right, 0 none. fmt treats a negative %*s width as left-align
+// memo returns cache[key], only calling compute the first time it sees key
+func memo[K comparable, V any](cache map[K]V, key K, compute func(K) V) V {
+	value, ok := cache[key]
+	if !ok {
+		value = compute(key)
+		cache[key] = value
+	}
+	return value
+}
+
+// align: -1 left, 1 right, 0 none
 type cell struct {
 	text  string
 	align int
 }
 
+// libc reopens /etc/passwd on every lookup, hence the memo. unknown ids print
+// as the raw number, right-aligned like every other number in real ls
+func owner_cell(uid uint32) cell {
+	id := strconv.Itoa(int(uid))
+	if u, error := user.LookupId(id); error == nil {
+		return cell{u.Username, -1}
+	}
+	return cell{id, 1}
+}
+
+func group_cell(gid uint32) cell {
+	id := strconv.Itoa(int(gid))
+	if g, error := user.LookupGroupId(id); error == nil {
+		return cell{g.Name, -1}
+	}
+	return cell{id, 1}
+}
+
+func time_string(sec int64) string {
+	return time.Unix(sec, 0).Format("Jan _2 15:04")
+}
+
 // two passes: stat everything first, then we know how wide each column is
-func print_long(out *bufio.Writer, dir string, names []string) {
+func print_long(out *bufio.Writer, root *os.Root, names []string) {
 	rows := make([][7]cell, 0, len(names))
 	var width [7]int
-	// libc reopens /etc/passwd on every lookup, so ask once per id. unknown ids
-	// print as the raw number, right-aligned like every other number in real ls
 	owners, groups := map[uint32]cell{}, map[uint32]cell{}
+	modes, times := map[uint32]string{}, map[int64]string{}
 
-	for _, name := range names {
-		full_path := filepath.Join(dir, name)
-		file_info, error := os.Lstat(full_path)
+	// stat in parallel, one chunk of names per cpu
+	infos, errors := make([]os.FileInfo, len(names)), make([]error, len(names))
+	chunk := max(1, (len(names)+runtime.NumCPU()-1)/runtime.NumCPU())
+	var wg sync.WaitGroup
+	for start := 0; start < len(names); start += chunk {
+		wg.Go(func() {
+			for i := start; i < min(start+chunk, len(names)); i++ {
+				if names[i] == ".." { // os.Root won't step outside itself
+					infos[i], errors[i] = os.Lstat(filepath.Join(root.Name(), ".."))
+				} else {
+					infos[i], errors[i] = root.Lstat(names[i])
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	for i, name := range names {
+		file_info, error := infos[i], errors[i]
 		if error != nil {
 			fmt.Fprintf(os.Stderr, "%s: %v\n", name, error)
 			continue
 		}
-		file_stats := file_info.Sys().(*syscall.Stat_t)
-		owner, ok := owners[file_stats.Uid]
-		if !ok {
-			owner = cell{strconv.Itoa(int(file_stats.Uid)), 1}
-			if u, error := user.LookupId(owner.text); error == nil {
-				owner = cell{u.Username, -1}
-			}
-			owners[file_stats.Uid] = owner
-		}
-		group, ok := groups[file_stats.Gid]
-		if !ok {
-			group = cell{strconv.Itoa(int(file_stats.Gid)), 1}
-			if g, error := user.LookupGroupId(group.text); error == nil {
-				group = cell{g.Name, -1}
-			}
-			groups[file_stats.Gid] = group
-		}
+		stat := file_info.Sys().(*syscall.Stat_t)
 		if file_info.Mode()&os.ModeSymlink != 0 {
-			if target, error := os.Readlink(full_path); error == nil {
+			if target, error := root.Readlink(name); error == nil {
 				name += " -> " + target
 			}
 		}
 		row := [7]cell{
-			{mode_string(uint32(file_stats.Mode)), 0},
-			{strconv.FormatUint(uint64(file_stats.Nlink), 10), 1},
-			owner,
-			group,
+			{memo(modes, uint32(stat.Mode), mode_string), 0},
+			{strconv.FormatUint(uint64(stat.Nlink), 10), 1},
+			memo(owners, stat.Uid, owner_cell),
+			memo(groups, stat.Gid, group_cell),
 			{strconv.FormatInt(file_info.Size(), 10), 1},
-			{file_info.ModTime().Format("Jan _2 15:04"), 0},
+			{memo(times, file_info.ModTime().Unix(), time_string), 0},
 			{name, 0},
 		}
-		for i, c := range row {
-			width[i] = max(width[i], len(c.text))
+		for column, c := range row {
+			width[column] = max(width[column], len(c.text))
 		}
 		rows = append(rows, row)
 	}
 
-	args := make([]any, 0, 14)
+	spaces := strings.Repeat(" ", slices.Max(width[:]))
 	for _, row := range rows {
-		args = args[:0]
-		for i, c := range row {
-			args = append(args, c.align*width[i], c.text)
+		for column, c := range row {
+			gap := spaces[:width[column]-len(c.text)]
+			if c.align > 0 {
+				out.WriteString(gap)
+			}
+			out.WriteString(c.text)
+			if c.align < 0 {
+				out.WriteString(gap)
+			}
+			if column < len(row)-1 {
+				out.WriteByte(' ')
+			}
 		}
-		fmt.Fprintf(out, "%*s %*s %*s %*s %*s %*s %*s\n", args...)
+		out.WriteByte('\n')
 	}
 }
